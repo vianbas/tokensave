@@ -214,8 +214,20 @@ fn suppress_go_selector_bare_siblings(resolved: &mut Vec<ResolvedRef>) {
 }
 
 /// Infer a coarse language tag from a file path extension.
-fn lang_from_path(path: &str) -> &'static str {
-    match path.rsplit('.').next().unwrap_or("") {
+fn lang_from_path(path: &str) -> &str {
+    // Both separators, so a Windows-shaped path with a dotted directory name
+    // cannot be mistaken for an extension.
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    // A path with no extension carries no language signal at all. `Makefile`
+    // has no dot; `.gitignore` has one but no stem before it. Both are the
+    // real unknown, and "" is the sentinel because no extension is empty.
+    let Some((stem, ext)) = file.rsplit_once('.') else {
+        return "";
+    };
+    if stem.is_empty() || ext.is_empty() {
+        return "";
+    }
+    match ext {
         "rs" => "rust",
         "go" => "go",
         "py" | "pyi" => "python",
@@ -237,7 +249,10 @@ fn lang_from_path(path: &str) -> &'static str {
         "nix" => "nix",
         "zig" => "zig",
         "proto" => "proto",
-        _ => "unknown",
+        // Two different unmapped extensions are still evidently two different
+        // languages, so the extension itself is a better tag than one shared
+        // "unknown" that makes every pair look like a match (#346).
+        _ => ext,
     }
 }
 
@@ -870,10 +885,8 @@ impl<'a> ReferenceResolver<'a> {
         if candidates.len() == 1 {
             let ref_lang = lang_from_path(&uref.file_path);
             let candidate_lang = lang_from_path(&candidates[0].file_path);
-            let confidence = if ref_lang != "unknown"
-                && candidate_lang != "unknown"
-                && ref_lang != candidate_lang
-            {
+            let both_tagged = !ref_lang.is_empty() && !candidate_lang.is_empty();
+            let confidence = if both_tagged && ref_lang != candidate_lang {
                 0.5
             } else {
                 0.9
@@ -950,10 +963,8 @@ impl<'a> ReferenceResolver<'a> {
         if candidates.len() == 1 {
             let ref_lang = lang_from_path(&uref.file_path);
             let candidate_lang = lang_from_path(&candidates[0].file_path);
-            let confidence = if ref_lang != "unknown"
-                && candidate_lang != "unknown"
-                && ref_lang != candidate_lang
-            {
+            let both_tagged = !ref_lang.is_empty() && !candidate_lang.is_empty();
+            let confidence = if both_tagged && ref_lang != candidate_lang {
                 0.5
             } else {
                 0.9
@@ -1015,7 +1026,7 @@ impl<'a> ReferenceResolver<'a> {
 
         // Language matching
         let candidate_lang = lang_from_path(&node.file_path);
-        if ref_lang != "unknown" && candidate_lang != "unknown" {
+        if !ref_lang.is_empty() && !candidate_lang.is_empty() {
             if ref_lang == candidate_lang {
                 score += 50;
             } else {
@@ -1262,4 +1273,50 @@ fn resolve_from_filtered_named(
         confidence: 0.65,
         resolved_by: resolved_by.to_string(),
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lang_from_path_tags_mapped_extensions() {
+        assert_eq!(lang_from_path("src/main.rs"), "rust");
+        assert_eq!(lang_from_path("pkg/util.go"), "go");
+        assert_eq!(lang_from_path("a/b/c.hpp"), "cpp");
+    }
+
+    #[test]
+    fn lang_from_path_tags_an_unmapped_extension_as_itself() {
+        // The point of #346: two unmapped extensions must not collide on one
+        // shared tag, or every pair of them looks like a language match.
+        assert_eq!(lang_from_path("tests/fixtures/sample.fst"), "fst");
+        assert_eq!(lang_from_path("tests/fixtures/sample.qb"), "qb");
+        assert_ne!(
+            lang_from_path("sample.fst"),
+            lang_from_path("sample.qb"),
+            "distinct unmapped extensions must carry distinct tags"
+        );
+    }
+
+    #[test]
+    fn lang_from_path_reserves_the_empty_tag_for_no_signal() {
+        // A file named `x.unknown` is why the sentinel cannot be "unknown".
+        assert_eq!(lang_from_path("x.unknown"), "unknown");
+        assert_eq!(lang_from_path("Makefile"), "");
+        assert_eq!(lang_from_path("src/Makefile"), "");
+        assert_eq!(lang_from_path(".gitignore"), "");
+        assert_eq!(lang_from_path("src/.gitignore"), "");
+        assert_eq!(lang_from_path("trailing."), "");
+    }
+
+    #[test]
+    fn lang_from_path_ignores_dots_in_directory_names() {
+        assert_eq!(lang_from_path("my.dir/README"), "");
+        assert_eq!(lang_from_path("my.dir/main.rs"), "rust");
+        // Same on a Windows-shaped path.
+        assert_eq!(lang_from_path("my.dir\\README"), "");
+        assert_eq!(lang_from_path("my.dir\\main.rs"), "rust");
+    }
 }
